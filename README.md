@@ -1,2 +1,2 @@
 # gmaps_geocode
-Utilizing Google Maps API to geolocalizate a table with adresses.
+Utilizing Google Maps API to geolocalizate an adress database.
