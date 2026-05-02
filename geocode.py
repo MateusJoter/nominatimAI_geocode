@@ -19,7 +19,7 @@ def inicializar_tabela_resultados(db_path):
     conn.commit()
     conn.close()
 
-def georeferenciar_com_trava(db_path, api_key, limite_maximo=39000):
+def georeferenciar_com_trava(db_path, layer_to_geo, api_key, limite_maximo=39000):
     """
     Executa a geocodificação com uma trava de segurança para não exceder a cota.
     """
@@ -30,9 +30,9 @@ def georeferenciar_com_trava(db_path, api_key, limite_maximo=39000):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
-    query_pendentes = """
+    query_pendentes = f"""
         SELECT DISTINCT endereco_completo 
-        FROM view_para_geocodificar 
+        FROM {layer_to_geo} 
         WHERE endereco_completo NOT IN (SELECT endereco_completo FROM geo_resultados)
     """
     cursor.execute(query_pendentes)
