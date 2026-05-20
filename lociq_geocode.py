@@ -1,142 +1,120 @@
 import sqlite3
 import pandas as pd
-import re
-import os
-from geopy.geocoders import LocationIQ
+from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 from tqdm import tqdm
 
-def obter_api_key():
-    """Lê a chave de API do arquivo local."""
-    try:
-        with open("apikey_lociq.txt", "r") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        print("Erro: Arquivo 'apikey_lociq.txt' não encontrado.")
-        exit()
-
 def carregar_dados(db_path, view_name):
-    """Carrega os dados da View do SQLite."""
     conn = sqlite3.connect(db_path)
-    df = pd.read_sql(f"SELECT * FROM {view_name}", conn)
+    query = f"SELECT * FROM {view_name}"
+
+    df = pd.read_sql(query, conn)
+
     conn.close()
+
     return df
 
-def limpar_logradouro_extenso(texto):
-    """
-    Limpa ruídos complexos de endereços brasileiros (CNPJ/Receita).
-    Remove termos que não contribuem para a geolocalização espacial.
-    """
-    if not texto: return ""
-    txt = str(texto).upper()
+def criar_cascata_enderecos(df):
+    # Seleciona as colunas baseado na estrutura da view/csv
+    cols = ['tipo_logradouro', 'logradouro', 'numero', 'bairro', 'municipio', 'uf']
     
-    # 1. Padrões de corte: Remove tudo o que vem após estes termos (geralmente complementos)
-    cortes = [r'\bLOJA\b', r'\bSALA\b', r'\bBOX\b', r'\bSTAND\b', r'\bPAVILHAO\b', r'\bARMAZEM\b', r'\bAPTO\b']
-    for c in cortes:
-        txt = re.split(c, txt)[0]
-
-    # 2. Remoção de termos específicos de ruído (Lotes, Glebas, KM, etc)
-    padroes_ruido = [
-        r'\bLOTE\s*[A-Z0-9/]*', r'\bLOTES\s*[A-Z0-9/]*', r'\bLT\s*[A-Z0-9/]*', r'\bLTS\s*[A-Z0-9/]*',
-        r'\bAREA\s*ESPECIAL\s*\d*', r'\bMODULO\s*\d*', r'\bGLEBA\s*\d*', r'\bSUBDIVISAO\s*[A-Z0-9]*',
-        r'\bPAVMTO\d*.*', r'\bPARTE\b.*', r'\bKM\s*[\d,.]*', r'\bS/N\b', r'\bSN\b',
-        r'\bCONJUNTO\s*[A-Z0-9]*', r'\bCJ\s*[A-Z0-9]*', r'\bCHACARA\s*\d*', r'\bGLEBA\s*\d*'
-    ]
+    for col in cols:
+        if col not in df.columns:
+            df[col] = ''
     
-    for p in padroes_ruido:
-        txt = re.sub(p, '', txt)
+    df_clean = df[cols].fillna('').astype(str)
     
-    # Limpeza de espaços extras e caracteres residuais
-    txt = re.sub(r'[,.-]', ' ', txt)
-    return re.sub(r'\s+', ' ', txt).strip()
+    def build_levels(row):
+        tl = row['tipo_logradouro'].strip()
+        log = row['logradouro'].strip()
+        num = row['numero'].strip()
+        bai = row['bairro'].strip()
+        mun = row['municipio'].strip()
+        uf = row['uf'].strip()
+        
+        rua = f"{tl} {log}".strip()
+        mun_uf = f"{mun} - {uf}".strip(" -")
+        
+        # Função auxiliar para evitar vírgulas duplas se algum campo estiver vazio
+        def join_parts(*parts):
+            valid_parts = [p for p in parts if p]
+            return ", ".join(valid_parts)
+            
+        # 1 - Porta / 2 - Logradouro / 3 - Bairro / 4 - Município
+        p1 = join_parts(f"{rua}, {num}" if rua and num else rua or num, bai, mun_uf)
+        p2 = join_parts(rua, bai, mun_uf)
+        p3 = join_parts(bai, mun_uf)
+        p4 = mun_uf
+        
+        return pd.Series([p1, p2, p3, p4])
+        
+    df[['nivel_1_porta', 'nivel_2_logradouro', 'nivel_3_bairro', 'nivel_4_municipio']] = df_clean.apply(build_levels, axis=1)
+    
+    return df
 
-def geolocalizar_base(df, nome_coluna, api_key):
-    """Geolocaliza usando o LocationIQ com sistema de cascata (fallback)."""
-    geolocator = LocationIQ(api_key=api_key, user_agent="cnpj_geocoder_v2")
-    # 0.6s de intervalo para respeitar o limite de 2 requisições por segundo
-    geocode_limitado = RateLimiter(geolocator.geocode, min_delay_seconds=0.6, max_retries=3)
+def separar_unicos(df):
+    # Mantém as combinações únicas considerando o endereço completo (nível 1)
+    unique_df = df[['nivel_1_porta', 'nivel_2_logradouro', 'nivel_3_bairro', 'nivel_4_municipio']].drop_duplicates(subset=['nivel_1_porta']).copy()
+    return unique_df
 
-    def resolver(row):
-        log_limpo = limpar_logradouro_extenso(row[nome_coluna])
-        cep = str(row.get('cep', '')).replace('.0', '').strip()
-        cidade = row.get('municipio', '')
-        uf = row.get('uf', '')
-        bairro = row.get('bairro', '')
+def geolocalizar(df):
+    geolocator = Nominatim(user_agent="meu_projeto_bulk_v1")
+    geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1, max_retries=2)
 
-        # Estratégia de Cascata para máxima qualidade
-        tentativas = [
-            (f"{log_limpo}, {cidade} - {uf}, {cep}, Brazil", "Alta (Logradouro+CEP)"),
-            (f"{log_limpo}, {bairro}, {cidade}, Brazil", "Média (Logradouro+Bairro)"),
-            (f"{cep}, Brazil", "Aproximada (CEP)"),
-            (f"{cidade} - {uf}, Brazil", "Baixa (Cidade)")
-        ]
+    tqdm.pandas(desc="Geolocalizando")
 
-        for query, grau in tentativas:
-            if not query or len(query) < 10: continue # Evita queries vazias ou muito curtas
-            try:
-                location = geocode_limitado(query)
-                if location:
-                    return str(location), location.latitude, location.longitude, grau
-            except:
+    def attempt_geocode(row):
+        # Tenta os níveis em cascata: 1 (Porta) -> 2 (Logradouro) -> 3 (Bairro) -> 4 (Município)
+        niveis = ['nivel_1_porta', 'nivel_2_logradouro', 'nivel_3_bairro', 'nivel_4_municipio']
+        
+        for precisao, col in enumerate(niveis, start=1):
+            addr = row[col]
+            if not addr or addr.strip() == "":
                 continue
-        return None, None, None, "Não Encontrado"
+            
+            loc = geocode(addr)
+            if loc:
+                return pd.Series([loc.latitude, loc.longitude, precisao])
+        
+        # Se falhar em todos os 4 níveis
+        return pd.Series([None, None, None])
 
-    print(f"Iniciando geocodificação de {len(df)} registros únicos...")
-    tqdm.pandas(desc="Progresso")
-    
-    resultados = df.progress_apply(resolver, axis=1)
-    df[['location', 'latitude', 'longitude', 'precisao']] = pd.DataFrame(resultados.tolist(), index=df.index)
+    df[['latitude', 'longitude', 'precisao']] = df.progress_apply(attempt_geocode, axis=1)
+
     return df
 
-def salvar_no_db(db_path, df, nome_coluna_original):
-    """Persiste os resultados no SQLite para evitar re-processamento."""
+def adiciona_ao_db(db_path, df):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    
-    cursor.execute("""
+
+    query = """
         CREATE TABLE IF NOT EXISTS enderecos_georreferenciados (
             endereco TEXT PRIMARY KEY,
-            location TEXT,
-            latitude TEXT,
-            longitude TEXT,
-            precisao TEXT
+            latitude REAL,
+            longitude REAL,
+            precisao INTEGER
         )
-    """)
+    """
+    cursor.execute(query)
 
-    dados_finais = []
-    for _, r in df.iterrows():
-        dados_finais.append((
-            str(r[nome_coluna_original]),
-            r['location'],
-            str(r['latitude']) if r['latitude'] else None,
-            str(r['longitude']) if r['longitude'] else None,
-            r['precisao']
-        ))
-
-    cursor.executemany(
-        "INSERT OR IGNORE INTO enderecos_georreferenciados VALUES (?, ?, ?, ?, ?)", 
-        dados_finais
-    )
+    # Filtra os dados necessários
+    lista_tuplas = df[['nivel_1_porta', 'latitude', 'longitude', 'precisao']].values.tolist()
+    
+    # Utiliza INSERT OR IGNORE para pular suavemente endereços já salvos
+    cursor.executemany("INSERT OR IGNORE INTO enderecos_georreferenciados (endereco, latitude, longitude, precisao) VALUES (?, ?, ?, ?)", lista_tuplas)
     conn.commit()
     conn.close()
 
-if __name__ == '__main__':
-    # Configurações de Caminho e Chave
-    db_path = r"C:\Users\Mateus Joter\Desktop\CNPJ\dados_receita.db"
-    view_alvo = 'DF_2025_tratado' # Mude para as outras views conforme necessário
-    api_key = obter_api_key()
 
-    # 1. Carregar dados
-    df_raw = carregar_dados(db_path, view_alvo)
+db_path = ''
+view_name = ''
+
+
+if __name__ == '__main__':
+    df = carregar_dados(db_path, view_name)
     
-    # 2. Filtrar apenas o que é único para não gastar API repetidamente
-    coluna_logradouro = 'logradouro' 
-    df_unicos = df_raw.drop_duplicates(subset=[coluna_logradouro, 'cep']).copy()
+    df = criar_cascata_enderecos(df)
+    df_unicos = separar_unicos(df)
+    df_geolocalizado = geolocalizar(df_unicos)
     
-    # 3. Executar Geolocalização
-    df_geo = geolocalizar_base(df_unicos, coluna_logradouro, api_key)
-    
-    # 4. Salvar resultados
-    salvar_no_db(db_path, df_geo, coluna_logradouro)
-    
-    print(f"\nSucesso! Os dados georreferenciados foram salvos em 'enderecos_georreferenciados'.")
+    adiciona_ao_db(db_path, df_geolocalizado)
